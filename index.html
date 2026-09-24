@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>まめSI森林公園</title>
+<style>
+html,body{margin:0;height:100%;background:#0b0e14;color:#dfe6ee;font-family:ui-monospace,Consolas,monospace;overflow:hidden}
+#gl{position:fixed;inset:0;width:100%;height:100%}
+#ui{position:fixed;top:10px;left:10px;background:rgba(11,14,20,.8);border:1px solid #263042;border-radius:10px;padding:10px 12px;font-size:12px;max-width:340px}
+#ui h1{font-size:14px;margin:0 0 6px}
+.row{display:flex;gap:8px;align-items:center;margin:5px 0;flex-wrap:wrap}
+button{background:#2b6cb0;color:#fff;border:0;border-radius:6px;padding:5px 9px;font-family:inherit;cursor:pointer;font-size:12px}
+input[type=range]{width:100px}
+input[type=number]{width:80px;background:#141a24;color:#dfe6ee;border:1px solid #263042;border-radius:4px;padding:3px}
+#stats{color:#8fa3bb;margin-top:6px;line-height:1.6}
+label{color:#aebfd4}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="ui">
+ <h1>🌲 まめSI森林公園（画像0枚・依存ゼロ）</h1>
+ <div class="row">
+  <button id="btnNew">新しい世界</button>
+  <label>seed <input type="number" id="seed" value="1234"></label>
+  <button id="btnGo">この種で生成</button>
+ </div>
+ <div class="row">
+  <label>時刻 <input type="range" id="tod" min="0" max="1" step="0.005" value="0.42"></label>
+  <label>風 <input type="range" id="wind" min="0" max="2" step="0.1" value="1"></label>
+  <label><input type="checkbox" id="rot" checked>自動回転</label>
+ </div>
+ <div class="row small">操作：ドラッグで視点回転 / ホイールでズーム</div>
+ <div id="stats"></div>
+</div>
+<script>
+"use strict";
+const cv=document.getElementById("gl");
+const gl=cv.getContext("webgl",{antialias:true});
+function resize(){const d=Math.min(devicePixelRatio||1,2);
+ cv.width=innerWidth*d;cv.height=innerHeight*d;gl.viewport(0,0,cv.width,cv.height);}
+addEventListener("resize",resize);resize();
+
+// ===== シェーダ（風・波・霧・太陽を全部ここで処理）=====
+const VS=`
+attribute vec3 aPos;attribute vec3 aNor;attribute vec4 aCol;attribute float aSw;
+uniform mat4 uMVP;uniform vec3 uSun,uSunC,uAmb,uFog,uEye;uniform float uT,uWind;uniform vec2 uFR;
+varying vec4 vC;
+void main(){
+ vec3 p=aPos;
+ if(aSw>0.0){ // 草・葉の風揺れ
+  float w=sin(uT*1.9+aPos.x*0.4+aPos.z*0.55)+0.4*sin(uT*3.7+aPos.z);
+  p.x+=w*aSw*0.3*uWind; p.z+=w*aSw*0.12*uWind;
+ }
+ if(aSw<0.0){ // 水面・雲の上下動
+  p.y+=(sin(uT*1.3+aPos.x*0.23+aPos.z*0.19)+0.5*sin(uT*2.1+aPos.x*0.11))*0.16*(-aSw);
+ }
+ float d=max(dot(normalize(aNor),uSun),0.0);
+ vec3 lit=aCol.rgb*(uAmb+uSunC*d);
+ float f=smoothstep(uFR.x,uFR.y,distance(uEye,p));
+ vC=vec4(mix(lit,uFog,f),aCol.a);
+ gl_Position=uMVP*vec4(p,1.0);
+}`;
+const FS=`precision mediump float;varying vec4 vC;void main(){gl_FragColor=vC;}`;
+function sh(t,s){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);
+ if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))throw gl.getShaderInfoLog(o);return o;}
+const pr=gl.createProgram();
+gl.attachShader(pr,sh(gl.VERTEX_SHADER,VS));
+gl.attachShader(pr,sh(gl.FRAGMENT_SHADER,FS));
+gl.linkProgram(pr);gl.useProgram(pr);
+const U={};for(const n of["uMVP","uSun","uSunC","uAmb","uFog","uEye","uT","uWind","uFR"])
+ U[n]=gl.getUniformLocation(pr,n);
+const A={};for(const n of["aPos","aNor","aCol","aSw"])A[n]=gl.getAttribLocation(pr,n);
+
+// ===== 数学ミニ道具箱 =====
+const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const norm=a=>{const l=Math.hypot(a[0],a[1],a[2])||1;return[a[0]/l,a[1]/l,a[2]/l];};
+const px=(c,u,v,s,t)=>[c[0]+u[0]*s+v[0]*t,c[1]+u[1]*s+v[1]*t,c[2]+u[2]*s+v[2]*t];
+function mPersp(fv,as,n,f){const t=1/Math.tan(fv/2);
+ return[t/as,0,0,0, 0,t,0,0, 0,0,(f+n)/(n-f),-1, 0,0,2*f*n/(n-f),0];}
+function mLook(e,c,up){const z=norm(sub(e,c)),x=norm(cross(up,z)),y=cross(z,x);
+ return[x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0, -dot(x,e),-dot(y,e),-dot(z,e),1];}
+function mMul(a,b){const o=[];
+ for(let c=0;c<4;c++)for(let r=0;r<4;r++){let s=0;
+  for(let k=0;k<4;k++)s+=a[k*4+r]*b[c*4+k];o.push(s);}return o;}
+
+// ===== 乱数とノイズ（世界の素材はこれだけ）=====
+function mulberry(s){return function(){s|=0;s=s+0x6D2B79F5|0;
+ let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;
+ return((t^t>>>14)>>>0)/4294967296;};}
+function hash2(x,z,se){let h=x*374761393+z*668265263+se*1442695041;
+ h=(h^h>>>13)|0;h=Math.imul(h,1274126177);return((h^h>>>16)>>>0)/4294967296;}
+function noise(x,z,se){const ix=Math.floor(x),iz=Math.floor(z),fx=x-ix,fz=z-iz,
+ s=t=>t*t*(3-2*t);
+ const a=hash2(ix,iz,se),b=hash2(ix+1,iz,se),c=hash2(ix,iz+1,se),d=hash2(ix+1,iz+1,se),
+ u=s(fx),v=s(fz);
+ return a+(b-a)*u+(c-a)*v+(a-b-c+d)*u*v;}
+function fbm(x,z,se){let s=0,a=1,f=1,n=0;
+ for(let o=0;o<5;o++){s+=a*noise(x*f,z*f,se+o*131);n+=a;a*=0.5;f*=2;}return s/n;}
+
+// ===== 地形（島）：高さ = fbm − 島の縁の減衰 =====
+let SEED=1234;
+function H(x,z){const r=Math.hypot(x,z);
+ let h=(fbm(x*0.017+40.7,z*0.017+13.3,SEED)-0.32)*34;
+ h+=(noise(x*0.09,z*0.09,SEED+55)-0.5)*4;
+ h-=Math.pow(r/118,3)*26;
+ return h;}
+function tNor(x,z){const e=0.7,hx=H(x+e,z)-H(x-e,z),hz=H(x,z+e)-H(x,z-e);
+ return norm([-hx,2*e,-hz]);}
+function tCol(x,z,h,ny){const n=noise(x*0.13,z*0.13,SEED+7);
+ if(h<0.8)return[0.72+n*0.08,0.66+n*0.06,0.47];          // 砂浜
+ if(ny<0.6)return[0.46+n*0.12,0.44+n*0.1,0.42+n*0.08];   // 崖＝岩肌
+ if(h>11.5)return[0.72+n*0.12,0.75+n*0.12,0.78+n*0.1];   // 山頂
+ return[0.24+n*0.2,0.46+n*0.18,0.16+n*0.12];}            // 草原
+
+// ===== ジオメトリ工房 =====
+function Geo(){return{P:[],N:[],C:[],S:[]};}
+function tri(a,b,c,col,sw,g){
+ const n=norm(cross(sub(b,a),sub(c,a))),al=col[3]==null?1:col[3];
+ g.P.push(a[0],a[1],a[2],b[0],b[1],b[2],c[0],c[1],c[2]);
+ for(let k=0;k<3;k++){g.N.push(n[0],n[1],n[2]);g.C.push(col[0],col[1],col[2],al);}
+ if(sw.length)g.S.push(sw[0],sw[1],sw[2]);else g.S.push(sw,sw,sw);}
+function quad(a,b,c,d,col,sw,g){tri(a,b,c,col,sw,g);tri(a,c,d,col,sw,g);}
+function cyl(a,b,r1,r2,col,sw,g){
+ const ax=norm(sub(b,a)),ref=Math.abs(ax[1])>0.88?[1,0,0]:[0,1,0];
+ const u=norm(cross(ax,ref)),v=cross(ax,u),S=4,R=[];
+ for(let s=0;s<=S;s++){const th=s/S*6.2832,c1=Math.cos(th),s1=Math.sin(th);
+  R.push([px(a,u,v,c1*r1,s1*r1),px(b,u,v,c1*r2,s1*r2)]);}
+ for(let s=0;s<S;s++)quad(R[s][0],R[s+1][0],R[s+1][1],R[s][1],col,sw,g);}
+
+let op,bl;
+// ===== 木：再帰10行が本体（前回説明したフラクタルそのもの）=====
+function leaves(q,s,base,rng){
+ for(let k=0;k<3;k++){
+  const c=[q[0]+(rng()-0.5)*s,q[1]+(rng()-0.25)*s*0.8,q[2]+(rng()-0.5)*s];
+  const u=norm([rng()-0.5,rng()-0.5,rng()-0.5]);
+  const v=norm(cross(u,[rng()-0.5,rng()+0.6,rng()-0.5]));
+  const e=s*(0.55+rng()*0.5),f=0.75+rng()*0.5;
+  const col=[base[0]*f,base[1]*f,base[2]*f];
+  quad(px(c,u,v,-e,-e),px(c,u,v,e,-e),px(c,u,v,e,e),px(c,u,v,-e,e),col,0.3,op);}}
+function tree(x,y,z,rng){
+ const bark=[0.4+rng()*0.12,0.28+rng()*0.07,0.18];
+ const aut=rng()<0.16; // 16%の確率で紅葉
+ const leaf=aut?[0.8+rng()*0.15,0.35+rng()*0.2,0.08]
+              :[0.16+rng()*0.14,0.42+rng()*0.2,0.12+rng()*0.06];
+ (function br(p,d,len,rad,dep){
+  const q=[p[0]+d[0]*len,p[1]+d[1]*len,p[2]+d[2]*len];
+  cyl(p,q,rad,rad*0.62,bark,dep>=3?0.06:0,op);
+  if(dep>=4||rad<0.055){leaves(q,Math.max(len*0.75,1.1),leaf,rng);return;}
+  const n=dep===0?3:(rng()<0.62?2:3);
+  for(let k=0;k<n;k++){
+   const nd=norm([d[0]+(rng()*2-1)*0.85,d[1]+0.25+rng()*0.55,d[2]+(rng()*2-1)*0.85]);
+   br(q,nd,len*(0.62+rng()*0.16),rad*0.58,dep+1);}
+ })([x,y-0.4,z],norm([(rng()-0.5)*0.25,1,(rng()-0.5)*0.25]),
+    3.1+rng()*1.9,0.42+rng()*0.22,0);}
+
+// ===== 世界の構築 =====
+function build(){
+ const t0=performance.now();
+ op=Geo();bl=Geo();
+ const rng=mulberry(SEED);
+ // --- 地形（対角線をランダムに割ってローポリの味を出す）
+ const GRID=108,SZ=236;
+ for(let i=0;i<GRID;i++)for(let j=0;j<GRID;j++){
+  const x0=(i/GRID-0.5)*SZ,x1=((i+1)/GRID-0.5)*SZ,
+        z0=(j/GRID-0.5)*SZ,z1=((j+1)/GRID-0.5)*SZ;
+  const Aq=[x0,H(x0,z0),z0],Bq=[x1,H(x1,z0),z0],Cq=[x1,H(x1,z1),z1],Dq=[x0,H(x0,z1),z1];
+  const col=tCol((x0+x1)/2,(z0+z1)/2,(Aq[1]+Bq[1]+Cq[1]+Dq[1])/4,tNor((x0+x1)/2,(z0+z1)/2)[1]);
+  if(hash2(i,j,SEED)<0.5){tri(Aq,Cq,Bq,col,0,op);tri(Aq,Dq,Cq,col,0,op);}
+  else{tri(Bq,Aq,Dq,col,0,op);tri(Bq,Dq,Cq,col,0,op);}}
+ // --- 水面（y=0、波はシェーダ任せ）
+ const WG=40,WS=320;
+ for(let i=0;i<WG;i++)for(let j=0;j<WG;j++){
+  const x0=(i/WG-0.5)*WS,x1=((i+1)/WG-0.5)*WS,z0=(j/WG-0.5)*WS,z1=((j+1)/WG-0.5)*WS;
+  const n=noise(x0*0.05,z0*0.05,SEED+21);
+  const col=[0.1+n*0.08,0.3+n*0.08,0.48,0.72];
+  tri([x0,0,z0],[x1,0,z1],[x1,0,z0],col,-1,bl);
+  tri([x0,0,z0],[x0,0,z1],[x1,0,z1],col,-1,bl);}
+ // --- 木（斜面と水辺を避けて抽選、過密防止つき）
+ let trees=0;const spots=[];
+ for(let t=0;t<900&&trees<46;t++){
+  const x=(rng()-0.5)*200,z=(rng()-0.5)*200,h=H(x,z);
+  if(h<1.2||h>10.5||tNor(x,z)[1]<0.74)continue;
+  if(spots.some(s=>(s[0]-x)**2+(s[1]-z)**2<49))continue;
+  spots.push([x,z]);trees++;tree(x,h,z,rng);}
+ // --- 草（1本＝三角形1枚×大量、先端だけ風で揺れる）
+ let grass=0;
+ for(let t=0;t<26000&&grass<12000;t++){
+  const x=(rng()-0.5)*210,z=(rng()-0.5)*210,h=H(x,z);
+  if(h<0.9||h>10.8||tNor(x,z)[1]<0.7)continue;
+  grass++;
+  const a=rng()*6.2832,w=0.05+rng()*0.05,ht=0.45+rng()*0.8;
+  const dx=Math.cos(a)*w,dz=Math.sin(a)*w,g=0.7+rng()*0.5;
+  tri([x-dx,h,z-dz],[x+dx,h,z+dz],
+      [x+(rng()-0.5)*0.5,h+ht,z+(rng()-0.5)*0.5],
+      [0.18*g,0.5*g,0.12*g],[0,0,0.5+ht*0.5],op);}
+ // --- 岩（歪んだ八面体）
+ let rocks=0;
+ for(let t=0;t<200&&rocks<26;t++){
+  const x=(rng()-0.5)*205,z=(rng()-0.5)*205,h=H(x,z);
+  if(h<0.7)continue;rocks++;
+  const s=0.5+rng()*1.3,gv=0.42+rng()*0.16,col=[gv,gv*1.03,gv*1.06];
+  const top=[x+(rng()-0.5)*s*0.5,h+s*(0.8+rng()*0.4),z+(rng()-0.5)*s*0.5];
+  const bot=[x,h-s*0.5,z],ring=[];
+  for(let k=0;k<4;k++){const an=k*1.57+rng()*0.6,r=s*(0.6+rng()*0.5);
+   ring.push([x+Math.cos(an)*r,h+(rng()-0.3)*s*0.3,z+Math.sin(an)*r]);}
+  for(let k=0;k<4;k++){
+   tri(top,ring[k],ring[(k+1)%4],col,0,op);
+   tri(bot,ring[(k+1)%4],ring[k],col,0,op);}}
+ // --- 雲（水平な白い板を重ねるだけ。下から見る分にはバレない）
+ for(let c=0;c<9;c++){
+  const cx=(rng()-0.5)*280,cz=(rng()-0.5)*280,cy=34+rng()*16,n=3+(rng()*3|0);
+  for(let k=0;k<n;k++){
+   const ox=cx+(rng()-0.5)*18,oz=cz+(rng()-0.5)*12,oy=cy+(rng()-0.5)*3;
+   const w=6+rng()*9,d2=3.5+rng()*5;
+   quad([ox-w,oy,oz-d2],[ox-w,oy,oz+d2],[ox+w,oy,oz+d2],[ox+w,oy,oz-d2],
+        [1,1,1,0.78],-0.25,bl);}}
+ up(op,B1);up(bl,B2);
+ document.getElementById("stats").innerHTML=
+  `頂点: ${((op.P.length+bl.P.length)/3|0).toLocaleString()} ／ 木: ${trees}本 ／ 草: ${grass}本 ／ 岩: ${rocks}個<br>`+
+  `生成時間: ${(performance.now()-t0).toFixed(0)}ms ／ 外部アセット: 0枚<br>`+
+  `世界の正体: ノイズ＋再帰＋乱数（seed=${SEED}）`;
+}
+
+// ===== GPU転送と描画 =====
+function mkBuf(){return{p:gl.createBuffer(),n:gl.createBuffer(),
+ c:gl.createBuffer(),s:gl.createBuffer(),cnt:0};}
+const B1=mkBuf(),B2=mkBuf();
+function up(g,B){const f=(b,d)=>{gl.bindBuffer(gl.ARRAY_BUFFER,b);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(d),gl.STATIC_DRAW);};
+ f(B.p,g.P);f(B.n,g.N);f(B.c,g.C);f(B.s,g.S);B.cnt=g.P.length/3;}
+function bind(B){const e=(b,l,n)=>{gl.bindBuffer(gl.ARRAY_BUFFER,b);
+  gl.enableVertexAttribArray(l);gl.vertexAttribPointer(l,n,gl.FLOAT,false,0,0);};
+ e(B.p,A.aPos,3);e(B.n,A.aNor,3);e(B.c,A.aCol,4);e(B.s,A.aSw,1);}
+
+// ===== 時刻→空・太陽・環境光のパレット =====
+const stops=[
+ [0.00,[.045,.06,.13],[.10,.12,.24],[.13,.15,.26]],
+ [0.23,[.89,.60,.44],[1.0,.72,.44],[.34,.30,.32]],
+ [0.50,[.55,.74,.94],[1.0,.96,.86],[.43,.47,.52]],
+ [0.77,[.84,.50,.36],[1.0,.55,.30],[.33,.28,.31]],
+ [1.00,[.045,.06,.13],[.10,.12,.24],[.13,.15,.26]]];
+function pal(t){let i=0;while(stops[i+1][0]<t)i++;
+ const a=stops[i],b=stops[i+1],u=(t-a[0])/(b[0]-a[0]);
+ const L=(p,q)=>[p[0]+(q[0]-p[0])*u,p[1]+(q[1]-p[1])*u,p[2]+(q[2]-p[2])*u];
+ return{sky:L(a[1],b[1]),sun:L(a[2],b[2]),amb:L(a[3],b[3])};}
+
+// ===== カメラ操作 =====
+let yaw=0.6,pitch=0.45,dist=95,drag=false,lx=0,ly=0;
+cv.addEventListener("pointerdown",e=>{drag=true;lx=e.clientX;ly=e.clientY;});
+addEventListener("pointerup",()=>drag=false);
+addEventListener("pointermove",e=>{if(!drag)return;
+ yaw+=(e.clientX-lx)*0.005;
+ pitch=Math.min(1.35,Math.max(0.08,pitch+(e.clientY-ly)*0.004));
+ lx=e.clientX;ly=e.clientY;});
+cv.addEventListener("wheel",e=>{dist=Math.min(190,Math.max(28,dist+e.deltaY*0.08));
+ e.preventDefault();},{passive:false});
+
+// ===== メインループ =====
+gl.enable(gl.DEPTH_TEST);
+const start=performance.now();
+function frame(){
+ const t=(performance.now()-start)/1000;
+ if(document.getElementById("rot").checked&&!drag)yaw+=0.0014;
+ const tod=parseFloat(document.getElementById("tod").value),p=pal(tod);
+ const a=(tod*2-0.5)*Math.PI;
+ let sd=[Math.cos(a)*0.8,Math.sin(a),0.35];
+ if(sd[1]<0.05)sd=[-sd[0]*0.5,0.4,0.5]; // 夜は月明かりに切替
+ sd=norm(sd);
+ const eye=[Math.sin(yaw)*Math.cos(pitch)*dist,
+            Math.sin(pitch)*dist+6,
+            Math.cos(yaw)*Math.cos(pitch)*dist];
+ const MVP=mMul(mPersp(0.9,cv.width/cv.height,0.5,600),mLook(eye,[0,6,0],[0,1,0]));
+ gl.clearColor(p.sky[0],p.sky[1],p.sky[2],1);
+ gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+ gl.uniformMatrix4fv(U.uMVP,false,MVP);
+ gl.uniform3fv(U.uSun,sd);gl.uniform3fv(U.uSunC,p.sun);gl.uniform3fv(U.uAmb,p.amb);
+ gl.uniform3fv(U.uFog,p.sky);gl.uniform3fv(U.uEye,eye);
+ gl.uniform1f(U.uT,t);
+ gl.uniform1f(U.uWind,parseFloat(document.getElementById("wind").value));
+ gl.uniform2f(U.uFR,dist*0.9,dist*0.9+150);
+ gl.disable(gl.BLEND);gl.depthMask(true);
+ bind(B1);gl.drawArrays(gl.TRIANGLES,0,B1.cnt);
+ gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);
+ bind(B2);gl.drawArrays(gl.TRIANGLES,0,B2.cnt);
+ requestAnimationFrame(frame);
+}
+document.getElementById("btnNew").onclick=()=>{SEED=Math.random()*99999|0;
+ document.getElementById("seed").value=SEED;build();};
+document.getElementById("btnGo").onclick=()=>{SEED=parseInt(document.getElementById("seed").value)||0;build();};
+build();frame();
+</script>
+</body>
+</html>
